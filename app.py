@@ -1006,8 +1006,23 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
                         results, LANGS[src_lang], LANGS[tgt_lang], sb
                     )
                     df = pd.DataFrame(results)
+
+                # 컬럼 순서 정리: 번역내용을 리뷰내용 바로 옆에
+                if "번역내용" in df.columns:
+                    cols = list(df.columns)
+                    cols.remove("번역내용")
+                    if "리뷰내용" in cols:
+                        idx = cols.index("리뷰내용") + 1
+                        cols.insert(idx, "번역내용")
+                    else:
+                        cols.append("번역내용")
+                    df = df[cols]
+
                 pb.progress(1.0)
-                sb.success(f"✅ 총 {len(df)}건 수집 완료! (중복 제거 후)")
+                sb.success(
+                    f"✅ 총 {len(df)}건 수집 완료! (중복 제거 후)"
+                    + (" — 표가 넓으면 좌우로 스크롤 해서 '번역내용' 컬럼 확인" if do_translate else "")
+                )
                 st.dataframe(df, use_container_width=True)
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine="openpyxl") as w:
