@@ -128,6 +128,110 @@ def auto_discover_review_url(url, status_box):
     return url
 
 
+# ─── 방법 -1: Shopline 플랫폼 (해외 자사몰) ─────────────────────────────────
+
+def scrape_shopline(url, max_pages, status_box, progress_bar):
+    """
+    Shopline 기반 사이트(홍콩/대만/동남아 자사몰)의 리뷰를 공식 API로 직접 수집.
+    API: /api/merchants/{merchant_id}/products/{product_id}/product_review_comments
+    페이지당 limit 최대 500건.
+    """
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
+        "Referer": url,
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        html = r.text
+    except Exception:
+        return None
+
+    # Shopline 플랫폼 시그니처
+    if "shoplineapp" not in html and "shoplineimg" not in html:
+        return None
+
+    # product_id (24자 hex)
+    m = re.search(r'data-product-id=["\']([a-f0-9]{20,30})["\']', html) \
+        or re.search(r'"product_id"\s*:\s*"([a-f0-9]{20,30})"', html)
+    if not m:
+        return None
+    product_id = m.group(1)
+
+    # merchant_id (shoplineimg.com 경로 또는 owner_id 쿼리에서 추출)
+    m = re.search(r'shoplineimg\.com/([a-f0-9]{20,30})/', html) \
+        or re.search(r'owner_id=([a-f0-9]{20,30})', html) \
+        or re.search(r'"merchant_id"\s*:\s*"([a-f0-9]{20,30})"', html)
+    if not m:
+        return None
+    merchant_id = m.group(1)
+
+    status_box.info(
+        f"🎯 Shopline 직결 모드 (merchant={merchant_id[:8]}…, product={product_id[:8]}…)"
+    )
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": headers["User-Agent"],
+        "Referer": url,
+        "Accept": "application/json",
+    })
+
+    all_reviews = []
+    page = 1
+    limit = 500  # Shopline 단일 호출 최대치
+    total = None
+
+    while page <= max_pages:
+        api_url = (
+            f"{base}/api/merchants/{merchant_id}"
+            f"/products/{product_id}/product_review_comments"
+            f"?page={page}&limit={limit}&order_=desc"
+        )
+        try:
+            resp = session.get(api_url, timeout=20)
+            j = resp.json()
+        except Exception as e:
+            status_box.warning(f"page {page} 실패: {e}")
+            break
+
+        items = j.get("items", []) or j.get("data", []) or []
+        if total is None:
+            total = j.get("total", 0)
+            status_box.info(f"📊 총 {total}건 감지 → 수집 시작")
+        if not items:
+            break
+
+        for it in items:
+            comment = it.get("comment", "")
+            if isinstance(comment, dict):
+                # i18n 포맷일 가능성
+                comment = comment.get("en") or comment.get("zh-hant") or next(iter(comment.values()), "")
+            all_reviews.append({
+                "리뷰번호": it.get("_id"),
+                "작성일": (it.get("commented_at") or "")[:10],
+                "작성자": it.get("user_name", ""),
+                "평점": it.get("score"),
+                "리뷰내용": clean(str(comment)),
+            })
+
+        progress_bar.progress(min(len(all_reviews) / max(total or 1, 1), 0.99))
+        status_box.info(f"📥 {len(all_reviews)}/{total} 수집...")
+
+        if total and len(all_reviews) >= total:
+            break
+        if len(items) < limit:
+            break
+        page += 1
+        time.sleep(random.uniform(0.2, 0.4))
+
+    return all_reviews if all_reviews else None
+
+
 # ─── 방법 0: Cafe24 (+ SNAP리뷰) 전용 빠른 수집 ─────────────────────────────
 
 def _detect_cafe24_strategy(base, product_no, session):
@@ -719,7 +823,13 @@ def smart_scrape(url, max_pages, status_box, progress_bar):
     # 0단계: 홈페이지면 리뷰 페이지 자동 탐색
     url = auto_discover_review_url(url, status_box)
 
-    # 1단계: Cafe24 + SNAP리뷰/표준 게시판 직결 (가장 빠르고 정확)
+    # 1-A단계: Shopline 플랫폼 (해외 자사몰)
+    reviews = scrape_shopline(url, max_pages, status_box, progress_bar)
+    if reviews:
+        progress_bar.progress(1.0)
+        return reviews
+
+    # 1-B단계: Cafe24 + SNAP리뷰/표준 게시판 직결 (가장 빠르고 정확)
     reviews = scrape_cafe24_snap(url, max_pages, status_box, progress_bar)
     if reviews:
         progress_bar.progress(1.0)
