@@ -872,6 +872,43 @@ LANGS = {
 }
 
 
+def _quick_detect_lang(text):
+    """문자셋 기반 빠른 언어 감지. Google auto-detect가 자주 실패하는 케이스 보완."""
+    if not text:
+        return None
+    # 일본어 가나 (히라가나/가타카나)
+    if re.search(r'[぀-ゟ゠-ヿ]', text):
+        return 'ja'
+    # 한글
+    if re.search(r'[가-힣]', text):
+        return 'ko'
+    # 한자가 있으면 번체/간체 구분
+    if re.search(r'[一-鿿]', text):
+        # 번체 자주 쓰이는 글자 (간체에선 다르게 씀)
+        trad_chars = '還開給謝個體會發業國學說對來這時間問題東車萬點門裡讓書'
+        simp_chars = '还开给谢个体会发业国学说对来这时间问题东车万点门里让书'
+        trad_count = sum(1 for c in text if c in trad_chars)
+        simp_count = sum(1 for c in text if c in simp_chars)
+        if trad_count > simp_count:
+            return 'zh-TW'
+        if simp_count > trad_count:
+            return 'zh-CN'
+        return 'zh-TW'  # 동률이면 번체로 (대만 시장 가정)
+    # 태국어
+    if re.search(r'[฀-๿]', text):
+        return 'th'
+    # 아랍어
+    if re.search(r'[؀-ۿ]', text):
+        return 'ar'
+    # 키릴(러시아)
+    if re.search(r'[Ѐ-ӿ]', text):
+        return 'ru'
+    # 베트남어 특수 발음 부호
+    if re.search(r'[ăâđêôơưĂÂĐÊÔƠƯ]', text):
+        return 'vi'
+    return 'en'  # 그 외 ASCII는 영어로 가정
+
+
 def translate_reviews(reviews, src_code, tgt_code, status_box):
     """리뷰의 '리뷰내용' 필드를 번역해서 '번역내용' 컬럼으로 추가."""
     try:
@@ -879,15 +916,42 @@ def translate_reviews(reviews, src_code, tgt_code, status_box):
     except ImportError:
         status_box.warning("⚠️ deep-translator 미설치 — pip install deep-translator")
         return reviews
-    translator = GoogleTranslator(source=src_code, target=tgt_code)
+
+    auto_mode = (src_code == "auto")
+    # auto가 아니면 단일 translator 재사용
+    fixed_translator = None if auto_mode else GoogleTranslator(source=src_code, target=tgt_code)
+    translator_cache = {}
+
+    def get_translator(src):
+        if src in translator_cache:
+            return translator_cache[src]
+        t = GoogleTranslator(source=src, target=tgt_code)
+        translator_cache[src] = t
+        return t
+
     total = len(reviews)
     for i, r in enumerate(reviews):
-        text = r.get("리뷰내용", "") or ""
+        text = (r.get("리뷰내용") or "").strip()
         if not text:
             r["번역내용"] = ""
             continue
+        sample = text[:4500]  # Google 5000자 제한
         try:
-            r["번역내용"] = translator.translate(text[:4500])  # Google 5000자 제한
+            if auto_mode:
+                detected = _quick_detect_lang(sample) or "auto"
+                if detected == tgt_code:
+                    r["번역내용"] = sample  # 이미 같은 언어
+                    continue
+                result = get_translator(detected).translate(sample)
+                # 결과가 입력과 같으면 (Google이 못 알아본 것) 'auto' 로 재시도
+                if result.strip() == sample.strip():
+                    try:
+                        result = get_translator("auto").translate(sample)
+                    except Exception:
+                        pass
+                r["번역내용"] = result
+            else:
+                r["번역내용"] = fixed_translator.translate(sample)
         except Exception as e:
             r["번역내용"] = f"[번역 실패: {str(e)[:60]}]"
         if (i + 1) % 20 == 0 or i + 1 == total:
