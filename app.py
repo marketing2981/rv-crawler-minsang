@@ -742,6 +742,50 @@ def smart_scrape(url, max_pages, status_box, progress_bar):
     return scrape_via_dom(url, max_pages, status_box, progress_bar)
 
 
+# ─── 번역 ────────────────────────────────────────────────────────────────────
+
+LANGS = {
+    "자동 감지": "auto",
+    "한국어": "ko",
+    "English": "en",
+    "日本語": "ja",
+    "中文 (간체)": "zh-CN",
+    "中文 (번체)": "zh-TW",
+    "Español": "es",
+    "Français": "fr",
+    "Deutsch": "de",
+    "Tiếng Việt": "vi",
+    "Bahasa Indonesia": "id",
+    "ภาษาไทย": "th",
+    "Русский": "ru",
+    "العربية": "ar",
+}
+
+
+def translate_reviews(reviews, src_code, tgt_code, status_box):
+    """리뷰의 '리뷰내용' 필드를 번역해서 '번역내용' 컬럼으로 추가."""
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        status_box.warning("⚠️ deep-translator 미설치 — pip install deep-translator")
+        return reviews
+    translator = GoogleTranslator(source=src_code, target=tgt_code)
+    total = len(reviews)
+    for i, r in enumerate(reviews):
+        text = r.get("리뷰내용", "") or ""
+        if not text:
+            r["번역내용"] = ""
+            continue
+        try:
+            r["번역내용"] = translator.translate(text[:4500])  # Google 5000자 제한
+        except Exception as e:
+            r["번역내용"] = f"[번역 실패: {str(e)[:60]}]"
+        if (i + 1) % 20 == 0 or i + 1 == total:
+            status_box.info(f"🌐 번역 {i+1}/{total}...")
+        time.sleep(0.08)
+    return reviews
+
+
 # ─── UI ──────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="스마트 리뷰 수집기", page_icon="🤖")
@@ -750,6 +794,23 @@ st.caption("자사몰 URL만 붙여넣으면 리뷰를 자동으로 찾아서 �
 
 url = st.text_input("🔗 URL 입력 (홈/상품/리뷰 페이지 모두 가능)")
 pages = st.number_input("🔢 최대 '더보기'/페이지 클릭 횟수 (DOM 폴백 시 적용)", 1, 2000, 100)
+
+with st.expander("🌐 번역 옵션 (선택)", expanded=False):
+    do_translate = st.checkbox("리뷰 내용을 번역해서 '번역내용' 컬럼 추가", value=False)
+    col_src, col_tgt = st.columns(2)
+    with col_src:
+        src_lang = st.selectbox("원본 언어", list(LANGS.keys()), index=0)
+    with col_tgt:
+        tgt_lang = st.selectbox(
+            "번역 대상 언어",
+            [k for k in LANGS.keys() if k != "자동 감지"],
+            index=1,  # English 기본
+        )
+    if do_translate:
+        st.caption(
+            f"💡 {len(LANGS)-1}개 언어 지원. 리뷰 1건당 약 0.2초 소요 (Google 무료 엔드포인트). "
+            "100건 이상이면 시간이 좀 걸리고 가끔 일시적 실패도 있을 수 있어요."
+        )
 
 if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     if not url:
@@ -760,7 +821,17 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
         try:
             results = smart_scrape(url, pages, sb, pb)
             if results:
+                # 중복 제거 먼저
                 df = pd.DataFrame(results).drop_duplicates(subset=["리뷰내용"])
+                results = df.to_dict("records")
+                # 번역 옵션이 켜져있으면 적용
+                if do_translate and results:
+                    pb.progress(0.0)
+                    sb.info(f"🌐 번역 시작 — {LANGS[src_lang]} → {LANGS[tgt_lang]} ({len(results)}건)")
+                    results = translate_reviews(
+                        results, LANGS[src_lang], LANGS[tgt_lang], sb
+                    )
+                    df = pd.DataFrame(results)
                 pb.progress(1.0)
                 sb.success(f"✅ 총 {len(df)}건 수집 완료! (중복 제거 후)")
                 st.dataframe(df, use_container_width=True)
