@@ -933,6 +933,178 @@ def scrape_board_review_platform(url, max_pages, status_box, progress_bar):
     return all_reviews if all_reviews else None
 
 
+# ─── 방법 Y: 네이버 스마트스토어 ─────────────────────────────────────────────
+
+def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
+    """
+    네이버 스마트스토어 리뷰 수집.
+    API: GET /i/v1/contents/reviews/gallery-attaches/{pathId}
+         ?checkoutMerchantNo={merchantNo}&searchSortType=REVIEW_RANKING&page=N&pageSize=100
+    Playwright로 실제 API 요청을 인터셉트해 pathId·merchantNo를 자동 추출 후 전 페이지 순회.
+    """
+    parsed = urlparse(url)
+    if "smartstore.naver.com" not in parsed.netloc:
+        return None
+    m = re.search(r"/products/(\d+)", parsed.path)
+    if not m:
+        return None
+
+    if not _ensure_playwright():
+        return None
+
+    status_box.info("🌐 스마트스토어 접속 중 (리뷰 API 탐지)...")
+
+    api_info = {}   # path_id, merchant_no, req_headers
+
+    def _on_resp(resp):
+        try:
+            if "gallery-attaches" in resp.url and resp.status == 200:
+                rp = urlparse(resp.url)
+                path_id = rp.path.rstrip("/").split("/")[-1]
+                params = parse_qs(rp.query)
+                merchant_no = params.get("checkoutMerchantNo", [None])[0]
+                if path_id and merchant_no and "path_id" not in api_info:
+                    api_info["path_id"] = path_id
+                    api_info["merchant_no"] = merchant_no
+                    api_info["user_agent"] = resp.request.headers.get("user-agent", "")
+        except Exception:
+            pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 390, "height": 844},
+        )
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        page = ctx.new_page()
+        page.on("response", _on_resp)
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+        page.wait_for_timeout(4000)
+
+        # 리뷰 탭 클릭 시도
+        if "path_id" not in api_info:
+            for sel in ["text=리뷰", "text=구매평", "[class*='tab'][class*='review']"]:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=1500):
+                        el.click()
+                        page.wait_for_timeout(3000)
+                        break
+                except Exception:
+                    continue
+
+        # 스크롤로 리뷰 섹션 lazy-load 트리거
+        if "path_id" not in api_info:
+            for _ in range(8):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1200)
+                if "path_id" in api_info:
+                    break
+
+        browser.close()
+
+    if not api_info:
+        status_box.warning("⚠️ 스마트스토어 리뷰 API를 캡처하지 못했습니다 (봇 감지 가능성).")
+        return None
+
+    path_id = api_info["path_id"]
+    merchant_no = api_info["merchant_no"]
+    status_box.info(f"🎯 스마트스토어 API 확보! (pathId={path_id}, merchantNo={merchant_no})")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": api_info.get("user_agent") or "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": url,
+    })
+
+    all_reviews = []
+    page_num = 1
+    total_count = None
+    page_size = 100
+    REVIEW_CONTENT_KEYS = ["reviewContent", "content", "text", "body", "reviewText"]
+    REVIEW_LIST_KEYS    = ["reviews", "contents", "list", "items", "reviewList", "data"]
+
+    while page_num <= max_pages:
+        api_url = (
+            f"https://m.smartstore.naver.com/i/v1/contents/reviews/gallery-attaches/{path_id}"
+            f"?checkoutMerchantNo={merchant_no}&searchSortType=REVIEW_RANKING"
+            f"&page={page_num}&pageSize={page_size}"
+        )
+        try:
+            resp = session.get(api_url, timeout=15)
+            d = resp.json()
+        except Exception as e:
+            status_box.warning(f"페이지 {page_num} 실패: {e}")
+            break
+
+        if total_count is None:
+            total_count = (
+                d.get("totalCount") or d.get("total")
+                or d.get("count") or d.get("totalElements") or 0
+            )
+            total_pages_est = max((total_count + page_size - 1) // page_size, 1)
+            status_box.info(f"📊 총 {total_count}건 감지 (≈{total_pages_est}페이지)")
+
+        reviews = next(
+            (d[k] for k in REVIEW_LIST_KEYS if isinstance(d.get(k), list)),
+            None,
+        )
+        if reviews is None:
+            # 한 단계 안쪽에서 재탐색
+            for v in d.values():
+                if isinstance(v, dict):
+                    reviews = next(
+                        (v[k] for k in REVIEW_LIST_KEYS if isinstance(v.get(k), list)),
+                        None,
+                    )
+                    if reviews is not None:
+                        break
+        if not reviews:
+            break
+
+        for item in reviews:
+            content = clean(
+                next((item[k] for k in REVIEW_CONTENT_KEYS if item.get(k)), "")
+            )
+            created = (
+                item.get("createDate") or item.get("date")
+                or item.get("createdAt") or item.get("writeDate") or ""
+            )
+            all_reviews.append({
+                "리뷰번호":  item.get("reviewNo") or item.get("id") or item.get("no"),
+                "작성일":   str(created)[:10],
+                "작성자":   item.get("writerNickname") or item.get("writer") or item.get("userId") or "",
+                "평점":     item.get("reviewScore") or item.get("score") or item.get("rating"),
+                "상품명":   item.get("productName") or item.get("goodsName") or "",
+                "옵션":     item.get("productOptionContent") or item.get("option") or "",
+                "리뷰내용": content,
+            })
+
+        progress_bar.progress(min(len(all_reviews) / max(total_count or 1, 1), 0.99))
+        status_box.info(f"📥 {page_num}페이지 (누적 {len(all_reviews)}/{total_count or '?'}건)")
+
+        if total_count and len(all_reviews) >= total_count:
+            break
+        if len(reviews) < page_size:
+            break
+        page_num += 1
+        time.sleep(random.uniform(0.3, 0.6))
+
+    return all_reviews if all_reviews else None
+
+
 # ─── 통합 진입점 ─────────────────────────────────────────────────────────────
 
 def smart_scrape(url, max_pages, status_box, progress_bar):
@@ -953,6 +1125,12 @@ def smart_scrape(url, max_pages, status_box, progress_bar):
 
     # 1-C단계: 네이처리퍼블릭 / board_review 커스텀 플랫폼
     reviews = scrape_board_review_platform(url, max_pages, status_box, progress_bar)
+    if reviews:
+        progress_bar.progress(1.0)
+        return reviews
+
+    # 1-D단계: 네이버 스마트스토어
+    reviews = scrape_naver_smartstore(url, max_pages, status_box, progress_bar)
     if reviews:
         progress_bar.progress(1.0)
         return reviews
