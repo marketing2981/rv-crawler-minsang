@@ -1158,34 +1158,48 @@ def _ns_paginate(path_id, merchant_no, referer, max_pages, status_box, progress_
 def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
     """
     네이버 스마트스토어 리뷰 수집.
-    1순위: requests로 채널 API → 상품 상세 API에서 pathId·merchantNo 추출
-    2순위: Playwright + stealth 인터셉트
+    Case A: gallery-attaches API URL을 직접 입력한 경우 → 즉시 페이지네이션
+    Case B: 상품 URL 입력 → requests로 파라미터 추출 시도 → Playwright 폴백
     """
     parsed = urlparse(url)
     if "smartstore.naver.com" not in parsed.netloc:
         return None
+
+    # ── Case A: API URL 직접 입력 ──────────────────────────────────────────
+    if "gallery-attaches" in parsed.path:
+        path_id = parsed.path.rstrip("/").split("/")[-1]
+        params = parse_qs(parsed.query)
+        merchant_no = params.get("checkoutMerchantNo", [None])[0]
+        if path_id and merchant_no:
+            status_box.info(f"🎯 스마트스토어 API URL 직접 인식 (pathId={path_id})")
+            reviews = _ns_paginate(path_id, merchant_no, url, max_pages, status_box, progress_bar)
+            return reviews if reviews else None
+        return None
+
+    # ── Case B: 상품 URL ───────────────────────────────────────────────────
     m = re.search(r"/products/(\d+)", parsed.path)
     if not m:
         return None
     product_no = m.group(1)
-    store = [p for p in parsed.path.split("/") if p][0]
+    store = next((p for p in parsed.path.split("/") if p), "")
 
     status_box.info(f"🛒 스마트스토어 감지 (store={store}, productNo={product_no})")
-
-    # 1순위: requests 기반
     status_box.info("🔍 채널 API로 파라미터 추출 시도...")
     path_id, merchant_no = _ns_get_params_via_requests(store, product_no, url)
 
-    # 2순위: Playwright
     if not path_id:
         status_box.info("🌐 Playwright로 API 인터셉트 시도...")
         path_id, merchant_no = _ns_get_params_via_playwright(url)
 
     if not path_id or not merchant_no:
-        status_box.warning("⚠️ 스마트스토어 파라미터를 추출하지 못했습니다.")
+        status_box.warning(
+            "⚠️ 스마트스토어 파라미터 자동 추출 실패 (클라우드 서버 IP 차단).\n"
+            "👉 Chrome DevTools → Network → Fetch/XHR → 리뷰 탭 클릭 후\n"
+            "   'gallery-attaches'가 포함된 URL을 복사해서 붙여넣어 주세요."
+        )
         return None
 
-    status_box.info(f"🎯 파라미터 확보 (pathId={path_id}, merchantNo={merchant_no}) → 수집 시작")
+    status_box.info(f"🎯 파라미터 확보 → 수집 시작")
     reviews = _ns_paginate(path_id, merchant_no, url, max_pages, status_box, progress_bar)
     return reviews if reviews else None
 
