@@ -817,6 +817,122 @@ def scrape_via_dom(url, max_pages, status_box, progress_bar):
     return all_reviews
 
 
+# ─── 방법 X: 네이처리퍼블릭 / board_review 플랫폼 ────────────────────────────
+
+def scrape_board_review_platform(url, max_pages, status_box, progress_bar):
+    """
+    네이처리퍼블릭 및 동일 커스텀 플랫폼 전용 수집기.
+    감지 기준: 페이지 HTML에 _mn.no 초기화 코드 + /board/board_review/getlist/review 패턴.
+    API: POST /board/board_review/getlist/review
+    - pagecount: 0-indexed 페이지 번호
+    - count 응답값 = 총 페이지 수 (페이지당 5건 고정)
+    """
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
+        "Referer": url,
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": base,
+    })
+
+    # 페이지 HTML에서 goods_id 및 플랫폼 시그니처 확인
+    try:
+        page_html = session.get(url, timeout=15).text
+    except Exception:
+        return None
+
+    goods_id_m = re.search(r'_mn\.no\s*=\s*["\']?(\d+)["\']?', page_html)
+    if not goods_id_m:
+        return None
+
+    # view.js에 board_review endpoint 존재 여부로 플랫폼 확정
+    js_url_m = re.search(r'src=["\']([^"\']*view\.js[^"\']*)["\']', page_html)
+    if js_url_m:
+        js_src = js_url_m.group(1)
+        if js_src.startswith('/'):
+            js_src = base + js_src
+        try:
+            js_text = session.get(js_src, timeout=10).text
+            if 'board_review/getlist/review' not in js_text:
+                return None
+        except Exception:
+            return None
+    else:
+        # view.js 없으면 HTML에서 직접 확인
+        if 'board_review/getlist/review' not in page_html:
+            return None
+
+    goods_id = goods_id_m.group(1)
+    goods_secret = "N"
+    m = re.search(r'_mn\.gs\s*=\s*["\']([^"\']+)["\']', page_html)
+    if m:
+        goods_secret = m.group(1)
+
+    status_box.info(f"🎯 네이처리퍼블릭/board_review 직결 모드 (goods_id={goods_id})")
+
+    all_reviews = []
+    page_num = 0
+    total_pages = None
+
+    while True:
+        try:
+            resp = session.post(
+                f"{base}/board/board_review/getlist/review",
+                data={
+                    "btnm": "review",
+                    "pagecount": page_num,
+                    "search": "",
+                    "ctg": "",
+                    "goods_id": goods_id,
+                    "rand": "N",
+                    "goods_secret": goods_secret,
+                    "cacheLogic": "mainReview",
+                    "site": "detail_view",
+                },
+                timeout=15,
+            )
+            j = resp.json()
+        except Exception as e:
+            status_box.warning(f"페이지 {page_num} 실패: {e}")
+            break
+
+        if total_pages is None:
+            total_pages = max(int(j.get("count", 1)) - 1, 0)
+            approx_total = (total_pages + 1) * 5
+            status_box.info(f"📊 총 {total_pages + 1}페이지 감지 (≈{approx_total}건)")
+
+        lists = j.get("lists", [])
+        if not lists:
+            break
+
+        for item in lists:
+            content = clean(item.get("bod_text", "") or item.get("bod_subject", ""))
+            reg = item.get("reg_dttm", "") or ""
+            all_reviews.append({
+                "리뷰번호": item.get("bod_no"),
+                "작성일": f"{reg[:4]}-{reg[4:6]}-{reg[6:8]}" if len(reg) >= 8 else reg,
+                "작성자": item.get("crt_usr_name", ""),
+                "평점": item.get("bod_score"),
+                "카테고리": item.get("bod_ctg", ""),
+                "제목": clean(item.get("bod_subject", "")),
+                "리뷰내용": content,
+                "옵션": item.get("option", ""),
+            })
+
+        progress_bar.progress(min((page_num + 1) / max(total_pages + 1, 1), 0.99))
+        status_box.info(f"📥 {page_num + 1}/{total_pages + 1} 페이지 (누적 {len(all_reviews)}건)")
+
+        if page_num >= total_pages:
+            break
+        page_num += 1
+        time.sleep(random.uniform(0.1, 0.25))
+
+    return all_reviews if all_reviews else None
+
+
 # ─── 통합 진입점 ─────────────────────────────────────────────────────────────
 
 def smart_scrape(url, max_pages, status_box, progress_bar):
@@ -831,6 +947,12 @@ def smart_scrape(url, max_pages, status_box, progress_bar):
 
     # 1-B단계: Cafe24 + SNAP리뷰/표준 게시판 직결 (가장 빠르고 정확)
     reviews = scrape_cafe24_snap(url, max_pages, status_box, progress_bar)
+    if reviews:
+        progress_bar.progress(1.0)
+        return reviews
+
+    # 1-C단계: 네이처리퍼블릭 / board_review 커스텀 플랫폼
+    reviews = scrape_board_review_platform(url, max_pages, status_box, progress_bar)
     if reviews:
         progress_bar.progress(1.0)
         return reviews
