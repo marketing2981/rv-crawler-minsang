@@ -938,11 +938,21 @@ def scrape_board_review_platform(url, max_pages, status_box, progress_bar):
 def _ns_make_session(referer):
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
         "Referer": referer,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     })
+    # Chrome에 저장된 Naver 쿠키 자동 로드 (로컬 실행 시)
+    try:
+        import browser_cookie3
+        cookies = browser_cookie3.chrome(domain_name=".naver.com")
+        s.cookies.update(cookies)
+    except Exception:
+        pass
     return s
 
 
@@ -1091,22 +1101,55 @@ def _ns_get_params_via_playwright(url):
     return api_info.get("path_id"), api_info.get("merchant_no")
 
 
-def _ns_paginate(path_id, merchant_no, referer, max_pages, status_box, progress_bar):
+def _ns_paginate(path_id, merchant_no, referer, max_pages, status_box, progress_bar, path_prefix="gallery-attaches"):
     """pathId·merchantNo로 리뷰 전 페이지 수집."""
     CONTENT_KEYS = ["reviewContent", "content", "text", "body", "reviewText"]
     LIST_KEYS    = ["reviews", "contents", "list", "items", "reviewList", "data"]
 
-    session = _ns_make_session(referer)
+    # curl_cffi로 Chrome TLS 핑거프린트 흉내 (requests보다 탐지 회피율 높음)
+    try:
+        from curl_cffi import requests as cffi_requests
+        _cookies = {}
+        try:
+            import browser_cookie3
+            for c in browser_cookie3.chrome(domain_name=".naver.com"):
+                _cookies[c.name] = c.value
+        except Exception:
+            pass
+        _cffi_kwargs = dict(
+            impersonate="chrome124",
+            cookies=_cookies,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+                "Referer": referer,
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            },
+            timeout=15,
+        )
+        _use_cffi = True
+    except ImportError:
+        _use_cffi = False
+        session = _ns_make_session(referer)
+
     all_reviews, page_num, total_count = [], 1, None
 
     while page_num <= max_pages:
         api_url = (
-            f"https://m.smartstore.naver.com/i/v1/contents/reviews/gallery-attaches/{path_id}"
+            f"https://m.smartstore.naver.com/i/v1/contents/reviews/{path_prefix}/{path_id}"
             f"?checkoutMerchantNo={merchant_no}&searchSortType=REVIEW_RANKING"
             f"&page={page_num}&pageSize=100"
         )
         try:
-            resp = session.get(api_url, timeout=15)
+            if _use_cffi:
+                resp = cffi_requests.get(api_url, **_cffi_kwargs)
+            else:
+                resp = session.get(api_url, timeout=15)
+            if resp.status_code == 429:
+                status_box.warning(f"⛔ Naver 레이트리밋(429) — 잠시 후 재시도하거나 VPN 사용")
+                break
             d = resp.json()
         except Exception as e:
             status_box.warning(f"페이지 {page_num} 실패: {e}")
@@ -1168,11 +1211,19 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
     # ── Case A: API URL 직접 입력 ──────────────────────────────────────────
     if "gallery-attaches" in parsed.path:
         path_id = parsed.path.rstrip("/").split("/")[-1]
+        # /reviews/ 이후 ~ path_id 직전까지가 prefix (e.g. "gallery-attaches" 또는 "group-products/gallery-attaches")
+        reviews_marker = "/reviews/"
+        idx = parsed.path.find(reviews_marker)
+        if idx >= 0:
+            after_reviews = parsed.path[idx + len(reviews_marker):]
+            path_prefix = after_reviews[:after_reviews.rfind("/")]
+        else:
+            path_prefix = "gallery-attaches"
         params = parse_qs(parsed.query)
         merchant_no = params.get("checkoutMerchantNo", [None])[0]
         if path_id and merchant_no:
-            status_box.info(f"🎯 스마트스토어 API URL 직접 인식 (pathId={path_id})")
-            reviews = _ns_paginate(path_id, merchant_no, url, max_pages, status_box, progress_bar)
+            status_box.info(f"🎯 스마트스토어 API URL 직접 인식 (pathId={path_id}, prefix={path_prefix})")
+            reviews = _ns_paginate(path_id, merchant_no, url, max_pages, status_box, progress_bar, path_prefix=path_prefix)
             return reviews if reviews else None
         return None
 

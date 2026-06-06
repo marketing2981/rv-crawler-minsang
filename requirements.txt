@@ -6,4 +6,6 @@ openpyxl>=3.1
 lxml>=5.0
 playwright>=1.40
 playwright-stealth>=1.0
+browser-cookie3>=0.19
+curl_cffi>=0.7
 deep-translator>=1.11
