@@ -935,38 +935,99 @@ def scrape_board_review_platform(url, max_pages, status_box, progress_bar):
 
 # ─── 방법 Y: 네이버 스마트스토어 ─────────────────────────────────────────────
 
-def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
-    """
-    네이버 스마트스토어 리뷰 수집.
-    API: GET /i/v1/contents/reviews/gallery-attaches/{pathId}
-         ?checkoutMerchantNo={merchantNo}&searchSortType=REVIEW_RANKING&page=N&pageSize=100
-    Playwright로 실제 API 요청을 인터셉트해 pathId·merchantNo를 자동 추출 후 전 페이지 순회.
-    """
-    parsed = urlparse(url)
-    if "smartstore.naver.com" not in parsed.netloc:
-        return None
-    m = re.search(r"/products/(\d+)", parsed.path)
-    if not m:
-        return None
+def _ns_make_session(referer):
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": referer,
+    })
+    return s
 
+
+def _ns_get_params_via_requests(store, product_no, referer):
+    """
+    requests만으로 pathId·merchantNo 추출 시도.
+    1) 스토어 채널 API → channelUid
+    2) 상품 상세 API  → checkoutProductNo(pathId), checkoutMerchantNo
+    """
+    s = _ns_make_session(referer)
+
+    # ① 채널 UID 취득
+    channel_uid = None
+    for api in [
+        f"https://m.smartstore.naver.com/i/v2/channels?storeName={store}",
+        f"https://smartstore.naver.com/i/v1/stores/{store}",
+        f"https://m.smartstore.naver.com/i/v1/stores/{store}",
+    ]:
+        try:
+            r = s.get(api, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                uid = (
+                    d.get("channelUid") or d.get("channel", {}).get("channelUid")
+                    or (d.get("channels") or [{}])[0].get("channelUid")
+                )
+                if uid:
+                    channel_uid = uid
+                    break
+        except Exception:
+            continue
+
+    if not channel_uid:
+        return None, None
+
+    # ② 상품 상세에서 pathId·merchantNo 추출
+    try:
+        r = s.get(
+            f"https://m.smartstore.naver.com/i/v2/channels/{channel_uid}/products/{product_no}?withWindow=false",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None, None
+        d = r.json()
+        # 재귀적으로 키 탐색
+        def _find(obj, keys, depth=0):
+            if depth > 6 or not isinstance(obj, dict):
+                return {}
+            found = {}
+            for k, v in obj.items():
+                if k in keys:
+                    found[k] = v
+                elif isinstance(v, dict):
+                    found.update(_find(v, keys, depth + 1))
+                elif isinstance(v, list):
+                    for item in v:
+                        found.update(_find(item, keys, depth + 1))
+            return found
+        vals = _find(d, {"checkoutProductNo", "checkoutMerchantNo", "originProductNo"})
+        path_id    = str(vals.get("checkoutProductNo") or vals.get("originProductNo") or "")
+        merchant_no = str(vals.get("checkoutMerchantNo") or "")
+        if path_id and merchant_no:
+            return path_id, merchant_no
+    except Exception:
+        pass
+    return None, None
+
+
+def _ns_get_params_via_playwright(url):
+    """Playwright + stealth 로 gallery-attaches 요청 인터셉트."""
     if not _ensure_playwright():
-        return None
+        return None, None
 
-    status_box.info("🌐 스마트스토어 접속 중 (리뷰 API 탐지)...")
-
-    api_info = {}   # path_id, merchant_no, req_headers
+    api_info = {}
 
     def _on_resp(resp):
         try:
             if "gallery-attaches" in resp.url and resp.status == 200:
                 rp = urlparse(resp.url)
                 path_id = rp.path.rstrip("/").split("/")[-1]
-                params = parse_qs(rp.query)
+                params  = parse_qs(rp.query)
                 merchant_no = params.get("checkoutMerchantNo", [None])[0]
                 if path_id and merchant_no and "path_id" not in api_info:
-                    api_info["path_id"] = path_id
+                    api_info["path_id"]     = path_id
                     api_info["merchant_no"] = merchant_no
-                    api_info["user_agent"] = resp.request.headers.get("user-agent", "")
         except Exception:
             pass
 
@@ -981,8 +1042,25 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
             timezone_id="Asia/Seoul",
             viewport={"width": 390, "height": 844},
         )
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        # 봇 감지 우회 스크립트
+        stealth_js = """
+        Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+        Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+        Object.defineProperty(navigator,'languages',{get:()=>['ko-KR','ko','en-US','en']});
+        window.chrome={runtime:{}};
+        """
+        ctx.add_init_script(stealth_js)
+
+        # playwright-stealth 패키지가 있으면 추가 적용
+        try:
+            from playwright_stealth import stealth_sync
+            _stealth_available = True
+        except ImportError:
+            _stealth_available = False
+
         page = ctx.new_page()
+        if _stealth_available:
+            stealth_sync(page)
         page.on("response", _on_resp)
 
         try:
@@ -991,9 +1069,8 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
             pass
         page.wait_for_timeout(4000)
 
-        # 리뷰 탭 클릭 시도
         if "path_id" not in api_info:
-            for sel in ["text=리뷰", "text=구매평", "[class*='tab'][class*='review']"]:
+            for sel in ["text=리뷰", "text=구매평"]:
                 try:
                     el = page.locator(sel).first
                     if el.is_visible(timeout=1500):
@@ -1003,44 +1080,30 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
                 except Exception:
                     continue
 
-        # 스크롤로 리뷰 섹션 lazy-load 트리거
-        if "path_id" not in api_info:
-            for _ in range(8):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1200)
-                if "path_id" in api_info:
-                    break
+        for _ in range(8):
+            if "path_id" in api_info:
+                break
+            page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
+            page.wait_for_timeout(1200)
 
         browser.close()
 
-    if not api_info:
-        status_box.warning("⚠️ 스마트스토어 리뷰 API를 캡처하지 못했습니다 (봇 감지 가능성).")
-        return None
+    return api_info.get("path_id"), api_info.get("merchant_no")
 
-    path_id = api_info["path_id"]
-    merchant_no = api_info["merchant_no"]
-    status_box.info(f"🎯 스마트스토어 API 확보! (pathId={path_id}, merchantNo={merchant_no})")
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": api_info.get("user_agent") or "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Referer": url,
-    })
+def _ns_paginate(path_id, merchant_no, referer, max_pages, status_box, progress_bar):
+    """pathId·merchantNo로 리뷰 전 페이지 수집."""
+    CONTENT_KEYS = ["reviewContent", "content", "text", "body", "reviewText"]
+    LIST_KEYS    = ["reviews", "contents", "list", "items", "reviewList", "data"]
 
-    all_reviews = []
-    page_num = 1
-    total_count = None
-    page_size = 100
-    REVIEW_CONTENT_KEYS = ["reviewContent", "content", "text", "body", "reviewText"]
-    REVIEW_LIST_KEYS    = ["reviews", "contents", "list", "items", "reviewList", "data"]
+    session = _ns_make_session(referer)
+    all_reviews, page_num, total_count = [], 1, None
 
     while page_num <= max_pages:
         api_url = (
             f"https://m.smartstore.naver.com/i/v1/contents/reviews/gallery-attaches/{path_id}"
             f"?checkoutMerchantNo={merchant_no}&searchSortType=REVIEW_RANKING"
-            f"&page={page_num}&pageSize={page_size}"
+            f"&page={page_num}&pageSize=100"
         )
         try:
             resp = session.get(api_url, timeout=15)
@@ -1054,41 +1117,28 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
                 d.get("totalCount") or d.get("total")
                 or d.get("count") or d.get("totalElements") or 0
             )
-            total_pages_est = max((total_count + page_size - 1) // page_size, 1)
-            status_box.info(f"📊 총 {total_count}건 감지 (≈{total_pages_est}페이지)")
+            status_box.info(f"📊 총 {total_count}건 감지")
 
-        reviews = next(
-            (d[k] for k in REVIEW_LIST_KEYS if isinstance(d.get(k), list)),
-            None,
-        )
+        reviews = next((d[k] for k in LIST_KEYS if isinstance(d.get(k), list)), None)
         if reviews is None:
-            # 한 단계 안쪽에서 재탐색
             for v in d.values():
                 if isinstance(v, dict):
-                    reviews = next(
-                        (v[k] for k in REVIEW_LIST_KEYS if isinstance(v.get(k), list)),
-                        None,
-                    )
+                    reviews = next((v[k] for k in LIST_KEYS if isinstance(v.get(k), list)), None)
                     if reviews is not None:
                         break
         if not reviews:
             break
 
         for item in reviews:
-            content = clean(
-                next((item[k] for k in REVIEW_CONTENT_KEYS if item.get(k)), "")
-            )
-            created = (
-                item.get("createDate") or item.get("date")
-                or item.get("createdAt") or item.get("writeDate") or ""
-            )
+            content = clean(next((item[k] for k in CONTENT_KEYS if item.get(k)), ""))
+            created = (item.get("createDate") or item.get("date") or item.get("createdAt") or "")
             all_reviews.append({
-                "리뷰번호":  item.get("reviewNo") or item.get("id") or item.get("no"),
-                "작성일":   str(created)[:10],
-                "작성자":   item.get("writerNickname") or item.get("writer") or item.get("userId") or "",
-                "평점":     item.get("reviewScore") or item.get("score") or item.get("rating"),
-                "상품명":   item.get("productName") or item.get("goodsName") or "",
-                "옵션":     item.get("productOptionContent") or item.get("option") or "",
+                "리뷰번호": item.get("reviewNo") or item.get("id"),
+                "작성일":  str(created)[:10],
+                "작성자":  item.get("writerNickname") or item.get("writer") or "",
+                "평점":    item.get("reviewScore") or item.get("score"),
+                "상품명":  item.get("productName") or "",
+                "옵션":    item.get("productOptionContent") or item.get("option") or "",
                 "리뷰내용": content,
             })
 
@@ -1097,12 +1147,47 @@ def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
 
         if total_count and len(all_reviews) >= total_count:
             break
-        if len(reviews) < page_size:
+        if len(reviews) < 100:
             break
         page_num += 1
         time.sleep(random.uniform(0.3, 0.6))
 
-    return all_reviews if all_reviews else None
+    return all_reviews
+
+
+def scrape_naver_smartstore(url, max_pages, status_box, progress_bar):
+    """
+    네이버 스마트스토어 리뷰 수집.
+    1순위: requests로 채널 API → 상품 상세 API에서 pathId·merchantNo 추출
+    2순위: Playwright + stealth 인터셉트
+    """
+    parsed = urlparse(url)
+    if "smartstore.naver.com" not in parsed.netloc:
+        return None
+    m = re.search(r"/products/(\d+)", parsed.path)
+    if not m:
+        return None
+    product_no = m.group(1)
+    store = [p for p in parsed.path.split("/") if p][0]
+
+    status_box.info(f"🛒 스마트스토어 감지 (store={store}, productNo={product_no})")
+
+    # 1순위: requests 기반
+    status_box.info("🔍 채널 API로 파라미터 추출 시도...")
+    path_id, merchant_no = _ns_get_params_via_requests(store, product_no, url)
+
+    # 2순위: Playwright
+    if not path_id:
+        status_box.info("🌐 Playwright로 API 인터셉트 시도...")
+        path_id, merchant_no = _ns_get_params_via_playwright(url)
+
+    if not path_id or not merchant_no:
+        status_box.warning("⚠️ 스마트스토어 파라미터를 추출하지 못했습니다.")
+        return None
+
+    status_box.info(f"🎯 파라미터 확보 (pathId={path_id}, merchantNo={merchant_no}) → 수집 시작")
+    reviews = _ns_paginate(path_id, merchant_no, url, max_pages, status_box, progress_bar)
+    return reviews if reviews else None
 
 
 # ─── 통합 진입점 ─────────────────────────────────────────────────────────────
